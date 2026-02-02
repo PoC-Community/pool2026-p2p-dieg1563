@@ -60,4 +60,20 @@ contract SmartContract {
     function _setAreYouABadPerson(bool _value) internal {
         _areYouABadPerson = _value;
     }
+
+    /**
+     * @notice Updates myInformations.city
+     */
+    function editMyCity(string calldata _newCity) public {
+        myInformations.city = _newCity;
+    }
+
+    /**
+     * @notice Returns full name: firstName + " " + lastName
+     */
+    function getMyFullName() public view returns (string memory) {
+        return string(
+            abi.encodePacked(myInformations.firstName, " ", myInformations.lastName)
+        );
+    }
 }
