@@ -7,6 +7,8 @@ contract SmartContract {
     address public myEthereumAddress = msg.sender;
     string public poCIsWhat = "PoC is good, PoC is life.";
 
+    address private owner;
+
     bool internal _isActive = true;
     bool internal _areYouABadPerson = false;
 
@@ -28,6 +30,15 @@ contract SmartContract {
     }
 
     Information public myInformations;
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
 
     /**
      * @notice Returns halfAnswerOfLife
@@ -59,6 +70,13 @@ contract SmartContract {
      */
     function _setAreYouABadPerson(bool _value) internal {
         _areYouABadPerson = _value;
+    }
+
+    /**
+     * @notice Completes halfAnswerOfLife by adding 21
+     */
+    function completeHalfAnswerOfLife() public onlyOwner {
+        halfAnswerOfLife += 21;
     }
 
     /**
