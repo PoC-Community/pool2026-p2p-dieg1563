@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
 import "../src/SmartContract.sol";
+import "../src/interfaces/ISmartContract.sol";
 
 // Helper contract to test internal functions
 contract SmartContractHelper is SmartContract {
@@ -69,20 +70,20 @@ contract SmartContractTest is Test {
     }
 
     // Test for struct data - default values
-    function test_StructDataDefaultValues() public {
+    function test_StructDataDefaultValues() public view {
         (
             string memory firstName,
             string memory lastName,
             uint8 age,
             string memory city,
-            SmartContract.roleEnum role
+            ISmartContract.roleEnum role
         ) = smartContract.myInformations();
 
         assertEq(bytes(firstName).length, 0, "firstName should be empty");
         assertEq(bytes(lastName).length, 0, "lastName should be empty");
         assertEq(age, 0, "age should be 0");
         assertEq(bytes(city).length, 0, "city should be empty");
-        assertTrue(role == SmartContract.roleEnum.STUDENT, "role should be STUDENT (default)");
+        assertTrue(role == ISmartContract.roleEnum.STUDENT, "role should be STUDENT (default)");
     }
 
     // Additional test for public variables

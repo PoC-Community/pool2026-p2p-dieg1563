@@ -1,6 +1,8 @@
 pragma solidity ^0.8.20;
 
-contract SmartContract {
+import "./interfaces/ISmartContract.sol";
+
+contract SmartContract is ISmartContract {
     uint256 public myNumber = 42;
     uint256 public halfAnswerOfLife = 21;
     address public myEthereumContractAddress = address(this);
@@ -19,15 +21,7 @@ contract SmartContract {
     mapping(string => uint256) public myGrades;
     string[5] public myPhoneNumber;
 
-    enum roleEnum { STUDENT,TEACHER }
-
-    struct Information {
-        string firstName;
-        string lastName;
-        uint8 age;
-        string city;
-        roleEnum role;
-    }
+    mapping(address => uint256) public balances;
 
     Information public myInformations;
 
@@ -80,6 +74,13 @@ contract SmartContract {
     }
 
     /**
+     * @notice Hashes a message using keccak256
+     */
+    function hashMyMessage(string calldata _message) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(_message));
+    }
+
+    /**
      * @notice Updates myInformations.city
      */
     function editMyCity(string calldata _newCity) public {
@@ -93,5 +94,35 @@ contract SmartContract {
         return string(
             abi.encodePacked(myInformations.firstName, " ", myInformations.lastName)
         );
+    }
+
+    /**
+     * @notice Returns the caller's balance
+     */
+    function getMyBalance() public view returns (uint256) {
+        return balances[msg.sender];
+    }
+
+    /**
+     * @notice Adds ETH to the caller's balance
+     */
+    function addToBalance() public payable {
+        balances[msg.sender] += msg.value;
+        emit BalanceUpdated(msg.sender, balances[msg.sender]);
+    }
+
+    /**
+     * @notice Withdraws ETH from the caller's balance
+     */
+    function withdrawFromBalance(uint256 _amount) public {
+        if (balances[msg.sender] < _amount) {
+            revert InsufficientBalance(balances[msg.sender], _amount);
+        }
+
+        balances[msg.sender] -= _amount;
+        (bool success, ) = msg.sender.call{value: _amount}("");
+        require(success, "Transfer failed");
+
+        emit BalanceUpdated(msg.sender, balances[msg.sender]);
     }
 }
