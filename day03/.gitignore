@@ -1,0 +1,29 @@
+# Dependencies
+lib/
+
+# Compiler outputs
+out/
+cache/
+cache_hardhat/
+cache_forge/
+
+# Broadcast logs
+broadcast/
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Foundry
+lcov.info
