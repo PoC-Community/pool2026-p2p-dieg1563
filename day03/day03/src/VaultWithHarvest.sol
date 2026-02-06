@@ -1,0 +1,430 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "./interfaces/IUniswapV2.sol";
+
+/**
+ * @title VaultWithHarvest
+ * @notice Advanced DeFi Vault with Uniswap integration for auto-compound rewards
+ *
+ * @dev Architecture:
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │                        VAULT ARCHITECTURE                               │
+ * │                                                                         │
+ * │   1. Users deposit POOL tokens                                          │
+ * │   2. Vault receives RWRD tokens as rewards                              │
+ * │   3. harvest() swaps RWRD -> POOL via Uniswap                            │
+ * │   4. Added POOL increases share value                                   │
+ * │                                                                         │
+ * │   [User] --deposit()--> [Vault] <--RWRD rewards                         │
+ * │                            |                                            │
+ * │                            v                                            │
+ * │                       harvest()                                         │
+ * │                            |                                            │
+ * │                            v                                            │
+ * │                      [Uniswap]                                          │
+ * │                    RWRD --> POOL                                        │
+ * │                            |                                            │
+ * │                            v                                            │
+ * │                  Ratio shares/POOL ^                                    │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ */
+contract VaultWithHarvest is ReentrancyGuard, Ownable {
+    using SafeERC20 for IERC20;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //                              STATE VARIABLES
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Main vault token (POOL) - users deposit this token
+    IERC20 public immutable asset;
+
+    /// @notice Reward token (RWRD) - will be swapped to asset
+    IERC20 public immutable rewardToken;
+
+    /// @notice Uniswap V2 Router for swaps
+    IUniswapV2Router02 public immutable uniswapRouter;
+
+    /// @notice Total shares issued
+    uint256 public totalShares;
+
+    /// @notice Mapping of shares per user
+    mapping(address => uint256) public sharesOf;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //                            HARVEST CONFIGURATION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Maximum slippage tolerated for swaps (in basis points, 100 = 1%)
+    uint256 public maxSlippage = 100; // 1% by default
+
+    /// @notice Last harvest timestamp
+    uint256 public lastHarvestTime;
+
+    /// @notice Minimum delay between two harvests (anti-spam)
+    uint256 public harvestCooldown = 1 hours;
+
+    /// @notice Total rewards converted to asset
+    uint256 public totalHarvested;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //                                  EVENTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    event Deposit(address indexed user, uint256 assets, uint256 shares);
+    event Withdraw(address indexed user, uint256 assets, uint256 shares);
+    event Harvest(
+        address indexed caller,
+        uint256 rewardAmount,
+        uint256 assetReceived
+    );
+    event SlippageUpdated(uint256 oldSlippage, uint256 newSlippage);
+    event CooldownUpdated(uint256 oldCooldown, uint256 newCooldown);
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //                                  ERRORS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    error ZeroAmount();
+    error InvalidAddress();
+    error InsufficientShares(uint256 requested, uint256 available);
+    error NoStakers();
+    error ZeroSharesMinted();
+    error ZeroAssetsToWithdraw();
+    error NoRewardsToHarvest();
+    error HarvestCooldownNotMet(uint256 timeRemaining);
+    error SlippageTooHigh(uint256 expected, uint256 received);
+    error InvalidSlippage();
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //                                CONSTRUCTOR
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Deploys the vault with Uniswap integration
+     * @param asset_ Main token (POOL)
+     * @param rewardToken_ Reward token (RWRD)
+     * @param uniswapRouter_ Uniswap V2 Router address
+     *
+     * Uniswap V2 Router addresses:
+     * - Ethereum Mainnet: 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D
+     * - Sepolia Testnet: 0xC532a74256D3Db42D0Bf7a0400fEFDbad7694008 (or deploy your own)
+     */
+    constructor(
+        address asset_,
+        address rewardToken_,
+        address uniswapRouter_
+    ) Ownable(msg.sender) {
+        if (asset_ == address(0)) revert InvalidAddress();
+        if (rewardToken_ == address(0)) revert InvalidAddress();
+        if (uniswapRouter_ == address(0)) revert InvalidAddress();
+
+        asset = IERC20(asset_);
+        rewardToken = IERC20(rewardToken_);
+        uniswapRouter = IUniswapV2Router02(uniswapRouter_);
+
+        lastHarvestTime = block.timestamp;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //                            INTERNAL FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @dev Converts assets to shares
+     */
+    function _convertToShares(uint256 assets) internal view returns (uint256) {
+        uint256 totalAssets_ = asset.balanceOf(address(this));
+
+        if (totalShares == 0 || totalAssets_ == 0) {
+            return assets;
+        }
+
+        return (assets * totalShares) / totalAssets_;
+    }
+
+    /**
+     * @dev Converts shares to assets
+     */
+    function _convertToAssets(uint256 shares) internal view returns (uint256) {
+        if (totalShares == 0) {
+            return 0;
+        }
+
+        uint256 totalAssets_ = asset.balanceOf(address(this));
+        return (shares * totalAssets_) / totalShares;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //                            DEPOSIT / WITHDRAW
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Deposits assets and receives shares
+     */
+    function deposit(
+        uint256 assets
+    ) external nonReentrant returns (uint256 shares) {
+        if (assets == 0) revert ZeroAmount();
+
+        shares = _convertToShares(assets);
+        if (shares == 0) revert ZeroSharesMinted();
+
+        totalShares += shares;
+        sharesOf[msg.sender] += shares;
+
+        asset.safeTransferFrom(msg.sender, address(this), assets);
+
+        emit Deposit(msg.sender, assets, shares);
+    }
+
+    /**
+     * @notice Withdraws assets by burning shares
+     */
+    function withdraw(
+        uint256 shares
+    ) external nonReentrant returns (uint256 assets) {
+        if (shares == 0) revert ZeroAmount();
+
+        uint256 userShares = sharesOf[msg.sender];
+        if (userShares < shares) revert InsufficientShares(shares, userShares);
+
+        assets = _convertToAssets(shares);
+        if (assets == 0) revert ZeroAssetsToWithdraw();
+
+        sharesOf[msg.sender] = userShares - shares;
+        totalShares -= shares;
+
+        asset.safeTransfer(msg.sender, assets);
+
+        emit Withdraw(msg.sender, assets, shares);
+    }
+
+    /**
+     * @notice Withdraws all user's assets
+     */
+    function withdrawAll() external nonReentrant returns (uint256 assets) {
+        uint256 userShares = sharesOf[msg.sender];
+        if (userShares == 0) revert ZeroAssetsToWithdraw();
+
+        if (userShares == 0) revert ZeroAmount();
+
+        assets = _convertToAssets(userShares);
+        if (assets == 0) revert ZeroAssetsToWithdraw();
+
+        sharesOf[msg.sender] = 0;
+        totalShares -= userShares;
+
+        asset.safeTransfer(msg.sender, assets);
+
+        emit Withdraw(msg.sender, assets, userShares);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //                              HARVEST FUNCTION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Converts accumulated reward tokens to asset tokens via Uniswap
+     * @return assetReceived Amount of assets added to vault
+     *
+     * @dev This function is the heart of the DeFi integration:
+     *
+     * Execution flow:
+     * 1. Verify there are rewards to harvest
+     * 2. Verify cooldown
+     * 3. Calculate acceptable minimum (slippage protection)
+     * 4. Approve the router
+     * 5. Execute the swap RWRD -> POOL
+     * 6. The received POOL stays in the vault, increasing the ratio
+     *
+     * Security:
+     * - Slippage protection against sandwich attacks
+     * - Cooldown to prevent spam
+     * - Anyone can call (decentralized)
+     *
+     * Note on decentralization:
+     * Allowing anyone to call harvest() is a common practice:
+     * - "Keepers" or bots can automate the harvest
+     * - No dependency on a centralized entity
+     * - Works like Yearn, Beefy, etc.
+     */
+    function harvest() external nonReentrant returns (uint256 assetReceived) {
+        // ═══════════════════════════════════════════════════════════════════
+        // STEP 1: CHECKS - Pre-conditions verification
+        // ═══════════════════════════════════════════════════════════════════
+
+        uint256 rewardBalance = rewardToken.balanceOf(address(this));
+        if (rewardBalance == 0) revert NoRewardsToHarvest();
+
+        uint256 timeSinceLastHarvest = block.timestamp - lastHarvestTime;
+        if (timeSinceLastHarvest < harvestCooldown) {
+            revert HarvestCooldownNotMet(harvestCooldown - timeSinceLastHarvest);
+        }
+
+        if (totalShares == 0) revert NoStakers();
+
+        // ═══════════════════════════════════════════════════════════════════
+        // STEP 2: EFFECTS - State updates
+        // ═══════════════════════════════════════════════════════════════════
+
+        lastHarvestTime = block.timestamp;
+
+        // ═══════════════════════════════════════════════════════════════════
+        // STEP 3: INTERACTIONS - External call to Uniswap
+        // ═══════════════════════════════════════════════════════════════════
+
+        uint256 expectedOutput = _getExpectedOutput(rewardBalance);
+        uint256 minOutput = (expectedOutput * (10000 - maxSlippage)) / 10000;
+
+        rewardToken.safeIncreaseAllowance(address(uniswapRouter), rewardBalance);
+
+        address[] memory path = new address[](2);
+        path[0] = address(rewardToken);
+        path[1] = address(asset);
+
+        uint256 assetBalanceBefore = asset.balanceOf(address(this));
+
+        uniswapRouter.swapExactTokensForTokens(
+            rewardBalance,
+            minOutput,
+            path,
+            address(this),
+            block.timestamp
+        );
+
+        uint256 assetBalanceAfter = asset.balanceOf(address(this));
+        assetReceived = assetBalanceAfter - assetBalanceBefore;
+
+        if (assetReceived < minOutput) {
+            revert SlippageTooHigh(minOutput, assetReceived);
+        }
+
+        totalHarvested += assetReceived;
+
+        emit Harvest(msg.sender, rewardBalance, assetReceived);
+    }
+
+    /**
+     * @notice Calculates the expected output amount for a swap
+     * @param rewardAmount Amount of reward tokens to swap
+     * @return expectedAsset Amount of asset tokens expected
+     *
+     * @dev Uses Uniswap's getAmountsOut to get current price
+     */
+    function _getExpectedOutput(
+        uint256 rewardAmount
+    ) internal view returns (uint256) {
+        if (rewardAmount == 0) return 0;
+
+        address[] memory path = new address[](2);
+        path[0] = address(rewardToken);
+        path[1] = address(asset);
+
+        try uniswapRouter.getAmountsOut(rewardAmount, path) returns (
+            uint[] memory amounts
+        ) {
+            return amounts[1];
+        } catch {
+            return 0;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //                              ADMIN FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Updates maximum tolerated slippage
+     * @param newSlippage New slippage in basis points (100 = 1%)
+     */
+    function setMaxSlippage(uint256 newSlippage) external onlyOwner {
+        if (newSlippage > 1000) revert InvalidSlippage(); // Max 10%
+
+        uint256 oldSlippage = maxSlippage;
+        maxSlippage = newSlippage;
+
+        emit SlippageUpdated(oldSlippage, newSlippage);
+    }
+
+    /**
+     * @notice Updates cooldown between harvests
+     * @param newCooldown New cooldown in seconds
+     */
+    function setHarvestCooldown(uint256 newCooldown) external onlyOwner {
+        uint256 oldCooldown = harvestCooldown;
+        harvestCooldown = newCooldown;
+
+        emit CooldownUpdated(oldCooldown, newCooldown);
+    }
+
+    /**
+     * @notice Recovers tokens sent by mistake (except asset and rewardToken)
+     * @param token Token to recover
+     * @param to Destination address
+     */
+    function rescueTokens(address token, address to) external onlyOwner {
+        require(token != address(asset), "Cannot rescue asset");
+        require(token != address(rewardToken), "Cannot rescue reward token");
+
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        IERC20(token).safeTransfer(to, balance);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //                              VIEW FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Total assets in the vault
+    function totalAssets() public view returns (uint256) {
+        return asset.balanceOf(address(this));
+    }
+
+    /// @notice Preview number of shares for a deposit
+    function previewDeposit(uint256 assets) external view returns (uint256) {
+        return _convertToShares(assets);
+    }
+
+    /// @notice Preview assets for a withdrawal
+    function previewWithdraw(uint256 shares) external view returns (uint256) {
+        return _convertToAssets(shares);
+    }
+
+    /// @notice Current ratio (multiplied by 1e18)
+    function currentRatio() external view returns (uint256) {
+        if (totalShares == 0) {
+            return 1e18;
+        }
+        return (totalAssets() * 1e18) / totalShares;
+    }
+
+    /// @notice Value of user's shares in assets
+    function assetsOf(address user) external view returns (uint256) {
+        return _convertToAssets(sharesOf[user]);
+    }
+
+    /// @notice Amount of reward tokens pending harvest
+    function pendingHarvest() external view returns (uint256) {
+        return rewardToken.balanceOf(address(this));
+    }
+
+    /// @notice Estimate assets we would get from harvesting now
+    function previewHarvest() external view returns (uint256) {
+        uint256 rewardBalance = rewardToken.balanceOf(address(this));
+        return _getExpectedOutput(rewardBalance);
+    }
+
+    /// @notice Time remaining until next possible harvest
+    function timeUntilNextHarvest() external view returns (uint256) {
+        uint256 timeSinceLastHarvest = block.timestamp - lastHarvestTime;
+        if (timeSinceLastHarvest >= harvestCooldown) {
+            return 0;
+        }
+        return harvestCooldown - timeSinceLastHarvest;
+    }
+}
