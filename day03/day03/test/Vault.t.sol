@@ -5,7 +5,6 @@ import "forge-std/Test.sol";
 import "../src/Vault.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
-// Simple test ERC20 token
 contract TestToken is ERC20 {
     constructor() ERC20("Test Token", "TEST") {
         _mint(msg.sender, 1_000_000 * 10 ** 18);
